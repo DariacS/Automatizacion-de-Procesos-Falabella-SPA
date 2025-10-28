@@ -1,0 +1,136 @@
+-- ============================================================
+-- LÓGICA GCP - Generación reporte "Producción rechazada definitiva pero vigente"
+-- Indicador: CL_SF_B2B_002
+-- Dataset destino: Resultados_AC
+-- Se generarán tablas mensuales para:
+--   - Último mes
+--   - Mes anterior al último
+--   - Mes actual (hasta el día de ejecución)
+-- Bucket destino: gs://produccion_no_publicado_bucket/
+-- ============================================================
+
+-- ============================================================
+-- 0. Definir variables de fecha para el mes en revisión (mes anterior)
+--    start_date : primer día del mes anterior
+--    end_date   : último día del mes anterior
+--    sufijo_mes : formato MMYYYY para nombrar la tabla y archivo CSV
+--    anio/mes   : para organizar carpetas en el bucket
+--    sql_union  : para actualizar acumulado
+-- ============================================================
+
+DECLARE start_date DATE DEFAULT DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH);
+DECLARE end_date DATE DEFAULT LAST_DAY(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH);
+DECLARE sufijo_mes STRING DEFAULT FORMAT_DATE("%m%Y", start_date);  -- Ej: 092025
+DECLARE anio STRING DEFAULT FORMAT_DATE("%Y", start_date);          -- Ej: 2025
+DECLARE mes STRING DEFAULT FORMAT_DATE("%m", start_date);           -- Ej: 09
+DECLARE sql_union STRING DEFAULT "";
+
+  -- ============================================================
+  -- 2.1. CREACIÓN DE TABLA UNIVERSO (Pre-filtros)
+  -- ============================================================
+  -- Contiene todas las propuestas emitidas en el mes sin exclusiones
+  EXECUTE IMMEDIATE FORMAT("""
+    CREATE OR REPLACE TABLE `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_002_universo_%s` AS
+    SELECT
+        FORMAT_DATE("%%Y/%%m", a.subscription_date) AS anio_mes,
+        a.proposal_num,
+        a.subscription_date,
+        a.valid_step_date,
+        d.company_desc,
+        a.subproduct_code,
+        d.subproduct_desc,
+        a.current_status_proposal_desc,
+        a.b2b_last_status_desc,
+        a.b2b_rejection_reason,
+        d.business_line_desc,
+        a.b2b_posting_date,
+        a.b2b_last_status_date
+    FROM `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_contract` a
+    LEFT JOIN `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_product` d
+      ON d.subproduct_code = a.subproduct_code AND d.core_key_id = a.core_key_id
+    WHERE a.core_key_id = 1
+      AND DATE(a.b2b_posting_date) BETWEEN DATE('%s') AND DATE('%s');
+  """, sufijo_mes, FORMAT_DATE('%Y-%m-%d', start_date), FORMAT_DATE('%Y-%m-%d', end_date));
+
+  -- ============================================================
+  -- 2.2. CREACIÓN DE TABLA EXCEPCIONES (Post-filtros)
+  -- ============================================================
+  -- Contiene únicamente las propuestas con inconsistencias
+  EXECUTE IMMEDIATE FORMAT("""
+    CREATE OR REPLACE TABLE `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_002_%s` AS
+    SELECT
+        FORMAT_DATE("%%Y/%%m", a.subscription_date) AS anio_mes,
+        a.proposal_num,
+        a.subscription_date,
+        a.valid_step_date,
+        d.company_desc,
+        a.subproduct_code,
+        d.subproduct_desc,
+        a.current_status_proposal_desc,
+        a.b2b_last_status_desc,
+        a.b2b_rejection_reason,
+        d.business_line_desc,
+        a.b2b_posting_date,
+        a.b2b_last_status_date
+    FROM `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_contract` a
+    LEFT JOIN `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_product` d
+      ON d.subproduct_code = a.subproduct_code AND d.core_key_id = a.core_key_id
+    WHERE a.core_key_id = 1
+      AND DATE(a.b2b_posting_date) BETWEEN DATE('%s') AND DATE('%s')
+      AND UPPER(TRIM(a.b2b_last_status_desc)) = 'RECHAZADA DEFINITIVA'
+      AND UPPER(TRIM(a.current_status_proposal_desc)) = 'VIGENTE';
+  """, sufijo_mes, FORMAT_DATE('%Y-%m-%d', start_date), FORMAT_DATE('%Y-%m-%d', end_date));
+
+  -- ============================================================
+  -- 2.3. Exportación de tablas a GCS
+  -- ============================================================
+EXECUTE IMMEDIATE FORMAT("""
+  EXPORT DATA OPTIONS(
+    uri='gs://gcp-cl-sf-b2b/GCP - CL_SF_B2B_002/%s/%s/CL_SF_B2B_002_universo_%s_*.csv',
+    format='CSV',
+    overwrite=true,
+    field_delimiter=';',
+    header=true
+  ) AS
+  SELECT * FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_002_universo_%s`
+  ORDER BY subscription_date, proposal_num;
+""", anio, mes, sufijo_mes, sufijo_mes);
+
+EXECUTE IMMEDIATE FORMAT("""
+  EXPORT DATA OPTIONS(
+    uri='gs://gcp-cl-sf-b2b/GCP - CL_SF_B2B_002/%s/%s/CL_SF_B2B_002_%s_*.csv',
+    format='CSV',
+    overwrite=true,
+    field_delimiter=';',
+    header=true
+  ) AS
+  SELECT * FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_002_%s`
+  ORDER BY subscription_date, proposal_num;
+""", anio, mes, sufijo_mes, sufijo_mes);
+
+-- ============================================================
+-- 3. Actualización de vista acumulada
+-- ============================================================
+-- Se incluyen todos los meses generados dinámicamente
+-- ============================================================
+FOR r IN (
+  SELECT table_name
+  FROM `fif-sfa-cl-audit-discovery.Resultados_AC.INFORMATION_SCHEMA.TABLES`
+  WHERE table_name LIKE 'CL_SF_B2B_002_%'
+    AND table_name NOT LIKE '%universo%'
+    AND table_name NOT LIKE '%acumulado%'
+  ORDER BY table_name
+)
+DO
+  SET sql_union = CONCAT(
+    sql_union,
+    IF(sql_union = "", "", " UNION ALL "),
+    "SELECT *, '", r.table_name, "' AS mes_analisis FROM `fif-sfa-cl-audit-discovery.Resultados_AC.", r.table_name, "`"
+  );
+END FOR;
+
+EXECUTE IMMEDIATE FORMAT("""
+  CREATE OR REPLACE VIEW `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_002_acumulado` AS
+  %s
+  ORDER BY anio_mes
+""", sql_union);

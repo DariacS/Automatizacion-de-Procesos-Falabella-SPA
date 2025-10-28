@@ -1,0 +1,190 @@
+-- ============================================================
+-- LÓGICA GCP - Generación reporte "Producción_no_publicado"
+-- Dataset: Resultados_AC
+-- Tablas mensuales:
+--   CL_SF_B2B_001_mmyyyy           -> excepciones (Post-filtros)
+--   CL_SF_B2B_001_universo_mmyyyy  -> universo (Pre-filtros)
+-- Bucket destino: gs://produccion_no_publicado_bucket/
+-- ============================================================
+
+-- ============================================================
+-- 0. Definir variables de fecha para el mes en revisión (mes anterior)
+--    start_date : primer día del mes anterior
+--    end_date   : último día del mes anterior
+--    sufijo_mes : formato MMYYYY para nombrar la tabla y archivo CSV
+--    anio/mes   : para organizar carpetas en el bucket
+--    sql_union  : para actualizar acumulado
+-- ============================================================
+
+DECLARE start_date DATE DEFAULT DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH);
+DECLARE end_date DATE DEFAULT LAST_DAY(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH);
+DECLARE sufijo_mes STRING DEFAULT FORMAT_DATE("%m%Y", start_date);  -- Ej: 092025
+DECLARE anio STRING DEFAULT FORMAT_DATE("%Y", start_date);          -- Ej: 2025
+DECLARE mes STRING DEFAULT FORMAT_DATE("%m", start_date);           -- Ej: 09
+DECLARE sql_union STRING DEFAULT "";
+
+-- ============================================================
+-- 1. Crear tabla de UNIVERSO (Pre-filtros)
+--    Esta tabla aplica todas las exclusiones y filtros finales.
+--    Se usa para generar el reporte definitivo.
+-- ============================================================
+
+EXECUTE IMMEDIATE FORMAT("""
+-- 1.1 Se parte desde la entidad base: svw_contract
+
+CREATE OR REPLACE TABLE `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_001_universo_%s` AS
+SELECT
+    FORMAT_DATE("%%Y/%%m", a.subscription_date) AS anio_mes,
+    a.proposal_num,
+    a.subscription_date,
+    a.valid_step_date,
+    d.company_desc,
+    a.subproduct_code,
+    d.product_desc,
+    q.branch_desc,
+    a.b2b_last_status_desc
+FROM `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_contract` a
+
+-- 1.2 Enriquecimiento con información de otras entidades
+
+LEFT JOIN `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_product` d
+    ON d.subproduct_code = a.subproduct_code
+   AND d.core_key_id = a.core_key_id
+LEFT JOIN `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_point_of_sale` q
+    ON q.branch_id = a.branch_id
+
+-- 1.3 Aplicación de filtros según la lógica de negocio
+
+WHERE a.core_key_id = 1
+  AND DATE(a.subscription_date) BETWEEN DATE('%s') AND DATE('%s');
+""", sufijo_mes, FORMAT_DATE('%Y-%m-%d', start_date), FORMAT_DATE('%Y-%m-%d', end_date));
+
+-- ============================================================
+-- 2. Crear tabla de EXCEPCIONES (Post-filtros)
+--    Esta tabla contiene todos los registros del mes en revisión
+--    antes de aplicar las exclusiones de negocio.
+-- ============================================================
+
+EXECUTE IMMEDIATE FORMAT("""
+-- 2.1 Se parte desde la entidad base: svw_contract
+
+CREATE OR REPLACE TABLE `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_001_%s` AS
+SELECT
+    FORMAT_DATE("%%Y/%%m", a.subscription_date) AS anio_mes,
+    a.proposal_num,
+    a.subscription_date,
+    a.valid_step_date,
+    d.company_desc,
+    a.subproduct_code,
+    d.product_desc,
+    q.branch_desc,
+    a.b2b_last_status_desc
+FROM `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_contract` a
+
+-- 2.2 Enriquecimiento con información de otras entidades
+
+LEFT JOIN `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_product` d
+    ON d.subproduct_code = a.subproduct_code AND d.core_key_id = a.core_key_id
+LEFT JOIN `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_point_of_sale` q
+    ON q.branch_id = a.branch_id
+
+-- 2.3 Aplicación de filtros según la lógica de negocio
+  
+WHERE a.core_key_id = 1
+  AND DATE(a.subscription_date) BETWEEN DATE('%s') AND DATE('%s')
+
+-- 2.4 Exclusiones:
+
+  AND d.company_desc <> 'AMERICA SOLIDARIA'
+  AND a.subproduct_code NOT IN ('ACHD3F','ACHD5F','ACHDXF','OCAFC2')
+  AND d.business_line_desc <> 'SOAP'
+
+-- 2.5 Selección adicional: sólo propuestas con b2b_last_status_desc vacío
+
+  AND (a.b2b_last_status_desc IS NULL OR a.b2b_last_status_desc = '');
+""", sufijo_mes, FORMAT_DATE('%Y-%m-%d', start_date), FORMAT_DATE('%Y-%m-%d', end_date));
+
+-- ============================================================
+-- 3. Exportar tabla EXCEPCIONES a GCS
+-- ============================================================
+
+EXECUTE IMMEDIATE FORMAT("""
+EXPORT DATA OPTIONS(
+  -- <<< RUTA AJUSTADA
+  uri='gs://gcp-cl-sf-b2b/GCP - CL_SF_B2B_001/%s/%s/CL_SF_B2B_001_%s_*.csv',
+  format='CSV',
+  overwrite=true,
+  field_delimiter=';',
+  header=true
+) AS
+SELECT
+  anio_mes,
+  proposal_num,
+  subscription_date,
+  valid_step_date,
+  subproduct_code,
+  branch_desc,
+  company_desc,
+  product_desc,
+  COALESCE(b2b_last_status_desc, '') AS b2b_last_status_desc
+FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_001_%s`
+ORDER BY subscription_date, proposal_num;
+""", anio, mes, sufijo_mes, sufijo_mes);
+
+-- ============================================================
+-- 4. Exportar tabla UNIVERSO a GCS
+-- ============================================================
+
+EXECUTE IMMEDIATE FORMAT("""
+EXPORT DATA OPTIONS(
+  -- <<< RUTA AJUSTADA
+  uri='gs://gcp-cl-sf-b2b/GCP - CL_SF_B2B_001/%s/%s/CL_SF_B2B_001_universo_%s_*.csv',
+  format='CSV',
+  overwrite=true,
+  field_delimiter=';',
+  header=true
+) AS
+SELECT
+  anio_mes,
+  proposal_num,
+  subscription_date,
+  valid_step_date,
+  subproduct_code,
+  branch_desc,
+  company_desc,
+  product_desc,
+  COALESCE(b2b_last_status_desc, '') AS b2b_last_status_desc
+FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_001_universo_%s`
+ORDER BY subscription_date, proposal_num;
+""", anio, mes, sufijo_mes, sufijo_mes);
+
+-- ============================================================
+-- 5. Actualizar vista dinámicamente
+-- Recorrer todas las tablas de excepciones existentes
+-- ============================================================
+
+FOR r IN (
+  SELECT table_name
+  FROM `fif-sfa-cl-audit-discovery.Resultados_AC.INFORMATION_SCHEMA.TABLES`
+  WHERE table_name LIKE 'CL_SF_B2B_001_%'
+    AND table_name NOT LIKE '%universo%'
+    AND table_name NOT LIKE '%acumulado%'
+  ORDER BY table_name
+)
+DO
+  SET sql_union = CONCAT(
+    sql_union,
+    IF(sql_union = "", "", " UNION ALL "),
+    "SELECT *, '", r.table_name, "' AS mes_analisis FROM `fif-sfa-cl-audit-discovery.Resultados_AC.", r.table_name, "`"
+  );
+END FOR;
+
+-- ============================================================
+-- 6. Actualizar vista acumulada
+-- ============================================================
+
+EXECUTE IMMEDIATE FORMAT("""
+CREATE OR REPLACE VIEW `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_001_acumulado` AS
+%s
+ORDER BY anio_mes
+""", sql_union);

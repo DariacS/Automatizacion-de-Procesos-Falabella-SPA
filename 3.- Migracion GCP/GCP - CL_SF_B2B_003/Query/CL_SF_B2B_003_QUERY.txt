@@ -1,0 +1,148 @@
+-- =======================================================================================
+-- LÓGICA GCP - Generación reporte "Producción (B2B) no aceptada por Compañías"
+-- Indicador: GCP - CL_SF_B2B_003
+-- =======================================================================================
+
+-- =======================================================================================
+-- 0. Definir variables de fecha para el mes en revisión (basado en valid_step_date)
+-- =======================================================================================
+DECLARE start_date DATE DEFAULT DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 2 MONTH), MONTH);
+DECLARE end_date DATE DEFAULT LAST_DAY(DATE_SUB(CURRENT_DATE(), INTERVAL 2 MONTH), MONTH);
+DECLARE sufijo_mes STRING DEFAULT FORMAT_DATE("%m%Y", start_date);
+DECLARE anio STRING DEFAULT FORMAT_DATE("%Y", start_date);
+DECLARE mes STRING DEFAULT FORMAT_DATE("%m", start_date);
+DECLARE sql_union STRING DEFAULT "";
+
+-- =======================================================================================
+-- 1. Crear tabla de UNIVERSO (Pre-filtros)
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+CREATE OR REPLACE TABLE `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_universo_%s` AS
+SELECT
+    FORMAT_DATE("%%Y/%%m", a.valid_step_date) AS anio_mes,
+    a.proposal_num, a.subscription_date, a.valid_step_date, d.company_desc,
+    a.subproduct_code, a.b2b_last_status_desc, a.current_status_proposal_desc
+FROM `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_contract` a
+LEFT JOIN `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_product` d
+    ON a.subproduct_code = d.subproduct_code AND a.core_key_id = d.core_key_id
+WHERE a.core_key_id = 1 AND DATE(a.valid_step_date) BETWEEN DATE('%s') AND DATE('%s');
+""", sufijo_mes, FORMAT_DATE('%Y-%m-%d', start_date), FORMAT_DATE('%Y-%m-%d', end_date));
+
+-- =======================================================================================
+-- 2. Crear tabla de EXCEPCIONES (Detalle de códigos en análisis)
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+CREATE OR REPLACE TABLE `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_%s` AS
+SELECT
+    FORMAT_DATE("%%Y/%%m", a.valid_step_date) AS anio_mes,
+    a.proposal_num, a.subscription_date, a.valid_step_date, d.company_desc,
+    a.subproduct_code, a.b2b_last_status_desc, a.current_status_proposal_desc
+FROM `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_contract` a
+LEFT JOIN `fif-sfa-cl-audit-discovery.svw_fif_sfa_cl_datalake__trf_entities.svw_product` d
+    ON a.subproduct_code = d.subproduct_code AND a.core_key_id = d.core_key_id
+WHERE a.core_key_id = 1 AND DATE(a.valid_step_date) BETWEEN DATE('%s') AND DATE('%s')
+  AND d.company_desc <> 'AMERICA SOLIDARIA'
+  AND (a.b2b_last_status_desc NOT IN ('ACEPTADA', 'RECHAZADA DEFINITIVA') OR a.b2b_last_status_desc IS NULL);
+""", sufijo_mes, FORMAT_DATE('%Y-%m-%d', start_date), FORMAT_DATE('%Y-%m-%d', end_date));
+
+-- =======================================================================================
+-- 3. Crear tabla de RESUMEN DE UNIVERSO
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+CREATE OR REPLACE TABLE `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_resumen_%s` AS
+SELECT
+    anio_mes,
+    COALESCE(b2b_last_status_desc, 'SIN ESTADO INFORMADO (NULO)') AS b2b_last_status_desc,
+    COUNT(proposal_num) AS suma_de_propuestas
+FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_universo_%s`
+GROUP BY anio_mes, b2b_last_status_desc
+ORDER BY anio_mes, suma_de_propuestas DESC;
+""", sufijo_mes, sufijo_mes);
+
+-- =======================================================================================
+-- 4. Crear tabla de RESULTADO TOLERANCIA 3%
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+CREATE OR REPLACE TABLE `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_resultado_%s` AS
+WITH
+  calculos AS (
+    SELECT
+      (SELECT COUNT(*) FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_%s`) AS total_no_gestionado,
+      (SELECT COUNT(*) FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_universo_%s`) AS total_de_datos
+  )
+SELECT
+  CONCAT('%s', '/', '%s') AS anio_mes,
+  total_no_gestionado,
+  total_de_datos,
+  CONCAT(CAST(ROUND(SAFE_DIVIDE(total_no_gestionado, total_de_datos) * 100, 2) AS STRING), '%%%%') AS porcentaje_no_gestionado,
+  '3%%' AS tolerancia,
+  CASE
+    WHEN SAFE_DIVIDE(total_no_gestionado, total_de_datos) <= 0.03 THEN 'Cumple'
+    ELSE 'No cumple'
+  END AS resultado
+FROM calculos;
+""", sufijo_mes, sufijo_mes, sufijo_mes, anio, mes);
+
+-- =======================================================================================
+-- 5. Exportar: Detalle de codigos en analisis (EXCEPCIONES)
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+EXPORT DATA OPTIONS(
+  uri='gs://gcp-cl-sf-b2b/GCP - CL_SF_B2B_003/%s/%s/CL_SF_B2B_003_excepciones_%s_*.csv',
+  format='CSV', overwrite=true, field_delimiter=';', header=true
+) AS SELECT * FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_%s`
+ORDER BY anio_mes, valid_step_date, proposal_num;
+""", anio, mes, sufijo_mes, sufijo_mes);
+
+-- =======================================================================================
+-- 6. Exportar: Universo completo
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+EXPORT DATA OPTIONS(
+  uri='gs://gcp-cl-sf-b2b/GCP - CL_SF_B2B_003/%s/%s/CL_SF_B2B_003_universo_%s_*.csv',
+  format='CSV', overwrite=true, field_delimiter=';', header=true
+) AS SELECT * FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_universo_%s`
+ORDER BY anio_mes, valid_step_date, proposal_num;
+""", anio, mes, sufijo_mes, sufijo_mes);
+
+-- =======================================================================================
+-- 7. Exportar: Resumen de codigos en análisis (RESUMEN POR ESTADO)
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+EXPORT DATA OPTIONS(
+  uri='gs://gcp-cl-sf-b2b/GCP - CL_SF_B2B_003/%s/%s/CL_SF_B2B_003_resumen_%s_*.csv',
+  format='CSV', overwrite=true, field_delimiter=';', header=true
+) AS SELECT * FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_resumen_%s`;
+""", anio, mes, sufijo_mes, sufijo_mes);
+
+-- =======================================================================================
+-- 8. Exportar: Resumen de Universos y % (RESULTADO FINAL)
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+EXPORT DATA OPTIONS(
+  uri='gs://gcp-cl-sf-b2b/GCP - CL_SF_B2B_003/%s/%s/CL_SF_B2B_003_resultado_%s_*.csv',
+  format='CSV', overwrite=true, field_delimiter=';', header=true
+) AS SELECT * FROM `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_resultado_%s`;
+""", anio, mes, sufijo_mes, sufijo_mes);
+
+-- =======================================================================================
+-- 9. Actualizar vista acumulada de excepciones dinámicamente
+-- =======================================================================================
+FOR r IN (
+  SELECT table_name FROM `fif-sfa-cl-audit-discovery.Resultados_AC.INFORMATION_SCHEMA.TABLES`
+  WHERE table_name LIKE 'CL_SF_B2B_003_%'
+    AND table_name NOT LIKE '%universo%' AND table_name NOT LIKE '%resumen%'
+    AND table_name NOT LIKE '%resultado%' AND table_name NOT LIKE '%acumulado%'
+  ORDER BY table_name
+) DO SET sql_union = CONCAT(
+    sql_union, IF(sql_union = "", "", " UNION ALL "),
+    "SELECT *, '", r.table_name, "' AS mes_analisis FROM `fif-sfa-cl-audit-discovery.Resultados_AC.", r.table_name, "`"
+  );
+END FOR;
+
+-- =======================================================================================
+-- 10. Crear o reemplazar la vista acumulada
+-- =======================================================================================
+EXECUTE IMMEDIATE FORMAT("""
+CREATE OR REPLACE VIEW `fif-sfa-cl-audit-discovery.Resultados_AC.CL_SF_B2B_003_acumulado` AS %s
+""", sql_union);
